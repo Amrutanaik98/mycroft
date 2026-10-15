@@ -402,6 +402,135 @@ function cmdGate(argv) {
 }
 
 // ---------------------------------------------------------------------------
+// check — does the recipe describe the scripts that exist?
+// ---------------------------------------------------------------------------
+
+// Every script carries --input and --output as plumbing, and no Step Commands table
+// documents them. Counting them as "built but undocumented" would bury the real
+// findings under 6 lines of noise per recipe.
+const PLUMBING = new Set(['--input', '--output', '--help']);
+
+// Read the flags a script accepts without executing it. argparse calls put the flag in
+// the first string argument, sometimes on the following line, so match across newlines.
+function scriptFlags(file) {
+  const src = fs.readFileSync(file, 'utf8');
+  const out = new Set();
+  const re = /add_argument\(\s*['"](--[a-z][a-z0-9-]*)['"]/g;
+  let m;
+  while ((m = re.exec(src)) !== null) out.add(m[1]);
+  return out;
+}
+
+function checkRecipe(recipe) {
+  const findings = [];
+  let comparable = 0; // steps whose script exists, so its flags could be compared
+  const add = (kind, where, detail) => findings.push({ kind, where, detail });
+
+  for (const step of recipe.steps.values()) {
+    if (!step.script) {
+      add('no-script-declared', step.slug, 'the Script Locations table has no row for this step');
+      continue;
+    }
+    if (!fs.existsSync(step.script)) {
+      add('script-missing', step.slug, `recipe names ${step.script}, which does not exist`);
+      continue;
+    }
+    comparable += 1;
+    const impl = scriptFlags(step.script);
+    for (const f of step.flags) {
+      if (!impl.has(f)) {
+        add('documented-not-built', step.slug, `recipe advertises ${f}; the script does not implement it`);
+      }
+    }
+    for (const f of impl) {
+      if (PLUMBING.has(f)) continue;
+      if (!step.flags.includes(f)) {
+        add('built-not-documented', step.slug, `script implements ${f}; the recipe does not list it`);
+      }
+    }
+  }
+
+  for (const gate of recipe.gates.values()) {
+    if (!gate.test) add('gate-without-test', `gate ${gate.gate}`, `"${gate.name}" declares no testable condition`);
+    if (!gate.capacity) add('gate-without-capacity', `gate ${gate.gate}`, `"${gate.name}" names no human capacity`);
+  }
+
+  if (!recipe.steps.size) add('no-steps', 'recipe', 'declares no steps in its Step Commands table');
+  return { findings, comparable };
+}
+
+function cmdCheck(argv) {
+  const all = argv.all || !argv._[0];
+  const slugs = all
+    ? fs.readdirSync(RECIPES_DIR)
+      .filter((f) => f.endsWith('.md') && !['_shared.md', 'README.md'].includes(f))
+      .map((f) => f.replace(/\.md$/, ''))
+    : [argv._[0].replace(/\.md$/, '')];
+
+  const byKind = new Map();
+  const perRecipe = [];
+  let scanned = 0;
+
+  for (const slug of slugs) {
+    let recipe;
+    try { recipe = loadRecipe(slug); } catch { continue; }
+    scanned += 1;
+    const { findings, comparable } = checkRecipe(recipe);
+    perRecipe.push({ slug, findings, comparable, steps: recipe.steps.size });
+    for (const f of findings) {
+      if (!byKind.has(f.kind)) byKind.set(f.kind, new Set());
+      byKind.get(f.kind).add(`${slug}::${f.where}::${f.detail.replace(/^.*?(--[a-z-]+).*$/, '$1')}`);
+    }
+  }
+
+  if (!all) {
+    const { slug, findings } = perRecipe[0];
+    console.log(`${bold(slug)}  ${findings.length ? `${findings.length} finding(s)` : 'no contract mismatches'}\n`);
+    for (const f of findings) {
+      console.log(`  ${f.kind.padEnd(24)} ${f.where.padEnd(26)} ${f.detail}`);
+    }
+    if (!findings.length) console.log(dim('  every declared step has a script, and its flags match what the script implements.'));
+    process.exit(findings.length ? 1 : 0);
+  }
+
+  // Repo-wide: the point is to show whether a finding is one shared defect or many
+  // separate ones. A kind that appears in nearly every recipe came from the template.
+  const affected = new Map();
+  for (const { slug, findings } of perRecipe) {
+    for (const f of new Set(findings.map((x) => x.kind))) {
+      affected.set(f, (affected.get(f) || 0) + 1);
+    }
+  }
+  const clean = perRecipe.filter((r) => !r.findings.length).length;
+  const total = perRecipe.reduce((n, r) => n + r.findings.length, 0);
+
+  // A flag mismatch can only be seen where the script exists to compare against. Scoring
+  // those findings out of all 97 recipes would report them as rare when they are near
+  // universal among the recipes where they are measurable at all -- a denominator that
+  // flatters the result. Each kind is scored against the population it could be found in.
+  const flagKinds = new Set(['documented-not-built', 'built-not-documented']);
+  const measurable = perRecipe.filter((r) => r.comparable > 0).length;
+
+  console.log(`${bold('recipe/script contract check')}  ·  ${scanned} recipes  ·  ${total} findings\n`);
+  console.log(`  ${'FINDING'.padEnd(26)} ${'OF MEASURABLE'.padEnd(15)} READ AS`);
+  for (const [kind, n] of [...affected.entries()].sort((a, b) => b[1] - a[1])) {
+    const denom = flagKinds.has(kind) ? measurable : scanned;
+    const share = denom ? Math.round((n / denom) * 100) : 0;
+    const reading = share >= 80 ? 'one template-wide defect' : share >= 20 ? 'a widespread pattern' : 'individual recipes';
+    console.log(`  ${kind.padEnd(26)} ${`${n}/${denom}`.padEnd(15)} ${String(share).padStart(3)}%  ${dim(reading)}`);
+  }
+  if (measurable < scanned) {
+    console.log(dim(`\n  Flag findings are scored out of the ${measurable} recipe(s) with at least one script on disk —`));
+    console.log(dim(`  the other ${scanned - measurable} have nothing to compare against, so counting them would understate the rate.`));
+  }
+  console.log(`\n  ${clean} recipe(s) with no mismatches.`);
+  console.log(dim('  A finding present in nearly every recipe is one defect in the template they share,\n'
+    + '  not N defects. Fix it there and it closes everywhere.'));
+  console.log(dim(`\n  Per recipe:  snickerdoodle check <recipe>`));
+  process.exit(total ? 1 : 0);
+}
+
+// ---------------------------------------------------------------------------
 // list / status / help
 // ---------------------------------------------------------------------------
 
@@ -429,6 +558,7 @@ function cmdHelp() {
 ${bold('USAGE')}
   snickerdoodle run <recipe> [--step <name>] [--mode dialogic] [--sample] [--no-write]
   snickerdoodle gate <recipe> --gate N --decision approve|deny|defer --note "..." [--by "Name"]
+  snickerdoodle check [<recipe>] [--all]
   snickerdoodle list [--built]
 
 ${bold('RUN')}
@@ -447,6 +577,15 @@ ${bold('GATE')}
   It refuses to record an ${bold('approve')} when the gate's test fails, refuses a decision
   without --note, and refuses to overwrite an existing decision without --force.
   deny and defer are first-class: a gate decided "no" is closed; an unexamined one is not.
+
+${bold('CHECK')}
+  Compares what a recipe documents against what its scripts implement, without
+  running anything: missing scripts, flags advertised but not built, flags built
+  but not documented, gates with no testable condition.
+
+  With no recipe (or --all) it scans every recipe and reports what share carries
+  each finding — a defect in 90% of recipes is one defect in the template they
+  share, not ninety.
 
 ${bold('NOTES')}
   The recipe is the configuration. Steps, scripts, gates and tests are read from the
@@ -481,6 +620,7 @@ function main() {
   if (!verb || verb === 'help' || argv.help) return cmdHelp();
   if (verb === 'run') return cmdRun(argv);
   if (verb === 'gate') return cmdGate(argv);
+  if (verb === 'check') return cmdCheck(argv);
   if (verb === 'list') return cmdList(argv);
   die(`unknown command "${verb}"\n  commands: run, gate, list, help`);
 }
