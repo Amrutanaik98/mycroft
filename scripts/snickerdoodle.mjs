@@ -1,0 +1,488 @@
+#!/usr/bin/env node
+// snickerdoodle.mjs
+//
+// The command-line surface that 97 of the 99 recipes already document and that, until
+// now, did not exist. Every recipe ends with a Snickerdoodle section telling the reader
+// to run `snickerdoodle run <recipe> --step <name>` and
+// `snickerdoodle gate <recipe> --gate N --decision approve --note "..."`. In practice the
+// step scripts were invoked by hand with `python3 scripts/<layer>/<recipe>-<step>.py`,
+// and gate decisions were written as JSON by hand.
+//
+// THE RECIPE IS THE CONFIG
+//
+// This tool has no config file and no registry of recipes. It reads the recipe markdown
+// and uses the four tables every recipe already carries:
+//
+//   ### Step Commands     slug -> step name, and which flags that step accepts
+//   ### Script Locations  step name -> script path, and which layer it belongs to
+//   ### Gate Commands     gate number -> the command, including its note
+//   ## Phase Gates        gate number -> name, testable condition, human capacity
+//
+// That is deliberate. A separate manifest would be a second source of truth for the same
+// facts, free to drift from the recipe, and P6 says intent lives in the recipe. Parsing
+// the recipe means a step renamed there is renamed here, with nothing to keep in sync.
+//
+// WHAT IT WILL NOT DO
+//
+//   - It does not invent steps. An unknown --step lists the ones the recipe declares.
+//   - It does not invent a script. If the recipe names a path that does not exist, it
+//     says so and stops, rather than guessing a filename from the slug.
+//   - `gate` runs the gate's own test from the recipe and records what it actually saw.
+//     It does not accept a decision for a gate whose test it could not run, because a
+//     decision with no evidence is the "looks good" that P4 exists to forbid.
+//   - `gate` will not overwrite an existing decision without --force. A gate decision is
+//     a record of a judgment someone made on a date; silently replacing one is editing
+//     history.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
+
+const RECIPES_DIR = 'recipes';
+const GATE_DIR = 'logs/gate-decisions';
+
+// ---------------------------------------------------------------------------
+// small helpers
+// ---------------------------------------------------------------------------
+
+const bold = (s) => `\u001b[1m${s}\u001b[0m`;
+const dim = (s) => `\u001b[2m${s}\u001b[0m`;
+
+function die(msg, code = 2) {
+  console.error(`snickerdoodle: ${msg}`);
+  process.exit(code);
+}
+
+function pythonCmd() {
+  for (const c of ['python3', 'python', 'py']) {
+    try {
+      execFileSync(c, ['--version'], { stdio: 'pipe' });
+      return c;
+    } catch { /* try the next candidate */ }
+  }
+  die('no python interpreter found (tried python3, python, py)');
+  return 'python3';
+}
+
+// Markdown table rows look like: | a | b | c |
+function tableRows(section) {
+  return section
+    .split('\n')
+    .filter((l) => l.trim().startsWith('|') && !/^\s*\|[\s|:-]+\|\s*$/.test(l))
+    .map((l) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim()))
+    .filter((cells) => cells.length >= 2);
+}
+
+function section(text, heading) {
+  // Capture from the heading to the next heading of the same or higher level.
+  const level = heading.match(/^#+/)[0].length;
+  const re = new RegExp(`^${heading}\\s*$`, 'm');
+  const m = text.match(re);
+  if (!m) return '';
+  const rest = text.slice(m.index + m[0].length);
+  const stop = rest.search(new RegExp(`^#{1,${level}} `, 'm'));
+  return stop === -1 ? rest : rest.slice(0, stop);
+}
+
+const backtick = (s) => (s.match(/`([^`]+)`/) || [null, s])[1];
+
+// ---------------------------------------------------------------------------
+// recipe parsing
+// ---------------------------------------------------------------------------
+
+function loadRecipe(name) {
+  const slug = name.replace(/\.md$/, '');
+  const file = path.join(RECIPES_DIR, `${slug}.md`);
+  if (!fs.existsSync(file)) {
+    const avail = fs.existsSync(RECIPES_DIR)
+      ? fs.readdirSync(RECIPES_DIR).filter((f) => f.endsWith('.md')).length
+      : 0;
+    die(`no recipe at ${file}\n  ${avail} recipes exist; try: snickerdoodle list`);
+  }
+  const text = fs.readFileSync(file, 'utf8');
+
+  // --- steps: slug -> { name, flags, script, layer } -------------------------
+  const steps = new Map();
+  for (const cells of tableRows(section(text, '### Step Commands'))) {
+    const [stepName, command, flags = ''] = cells;
+    if (/^Step$/i.test(stepName)) continue;
+    const slugMatch = command.match(/--step\s+([a-z0-9-]+)/);
+    if (!slugMatch) continue;
+    steps.set(slugMatch[1], {
+      slug: slugMatch[1],
+      name: stepName,
+      flags: (flags.match(/`--[a-z-]+`/g) || []).map((f) => f.replace(/`/g, '')),
+      script: null,
+      layer: null,
+    });
+  }
+  // Script Locations keys on the step NAME, so join on that.
+  for (const cells of tableRows(section(text, '### Script Locations'))) {
+    const [stepName, scriptPath, layer = ''] = cells;
+    if (/^Step$/i.test(stepName)) continue;
+    const entry = [...steps.values()].find((s) => s.name === stepName);
+    if (entry) {
+      entry.script = backtick(scriptPath);
+      entry.layer = layer;
+    }
+  }
+
+  // --- gates: N -> { name, condition, test, capacity } -----------------------
+  const gates = new Map();
+  for (const line of section(text, '## Phase Gates').split('\n')) {
+    const m = line.match(/^\s*(\d+)\.\s*(.+?):\s*(.*)$/);
+    if (!m) continue;
+    const [, num, gname, rest] = m;
+    const test = (rest.match(/Test:\s*`([^`]+)`/) || [])[1] || null;
+    const capacity = (rest.match(/Human capacity:\s*\[([A-Z]+)\]/) || [])[1] || null;
+    const condition = rest.split(/Test:/)[0].trim().replace(/\.$/, '');
+    gates.set(Number(num), { gate: Number(num), name: gname.trim(), condition, test, capacity });
+  }
+
+  // --- frontmatter -----------------------------------------------------------
+  const fm = {};
+  const fmBlock = text.startsWith('---\n') ? text.slice(4, text.indexOf('\n---', 4)) : '';
+  for (const line of fmBlock.split('\n')) {
+    const m = line.match(/^([a-z_]+):\s*(.*)$/);
+    if (m) fm[m[1]] = m[2].replace(/^["']|["']$/g, '');
+  }
+
+  const title = (text.match(/^#\s+(.+)$/m) || [null, slug])[1];
+  return { slug, file, text, title, steps, gates, frontmatter: fm };
+}
+
+// ---------------------------------------------------------------------------
+// run
+// ---------------------------------------------------------------------------
+
+function runStep(recipe, step, passthrough, { quiet = false } = {}) {
+  if (!step.script) {
+    die(`recipe declares no script path for step "${step.slug}"\n  add it to the Script Locations table in ${recipe.file}`);
+  }
+  if (!fs.existsSync(step.script)) {
+    die(
+      `the recipe names a script that does not exist:\n  ${step.script}\n` +
+      `  declared for step "${step.slug}" in ${recipe.file}\n` +
+      '  this step is not built yet; snickerdoodle will not guess a different path',
+    );
+  }
+  // Only pass a flag to a step that the RECIPE says that step accepts. The recipe is
+  // the contract; sending a step a flag it never advertised is how a runner papers over
+  // a mismatch between what is documented and what is built.
+  //
+  // There is no special case here on purpose. An earlier version let --fixture-set ride
+  // along wherever --sample was allowed, reasoning that it was "an argument to --sample".
+  // It was passed straight to a step that does not implement it, which is exactly the
+  // guessing this filter exists to prevent. The fix was to document the flag in the
+  // recipe for the five steps that do implement it, so the table decides.
+  const allowed = new Set(step.flags);
+  const VALUED = new Set(['--fixture-set']);
+  const filtered = [];
+  const dropped = [];
+  for (let i = 0; i < passthrough.length; i += 1) {
+    const f = passthrough[i];
+    if (!f.startsWith('--')) { filtered.push(f); continue; }
+    const takesValue = VALUED.has(f);
+    if (allowed.has(f)) {
+      filtered.push(f);
+      if (takesValue && passthrough[i + 1] !== undefined) filtered.push(passthrough[i + 1]);
+    } else {
+      dropped.push(f);
+    }
+    if (takesValue) i += 1;
+  }
+  if (dropped.length) {
+    console.error(dim(`  ${dropped.join(' ')} not declared for this step in the recipe — not passed`));
+  }
+  if (!quiet) console.error(dim(`→ ${step.slug}  ${step.script}`));
+  const r = spawnSync(pythonCmd(), [step.script, ...filtered], { stdio: 'inherit' });
+  if (r.status === 2) {
+    // argparse exits 2 on an unrecognised argument. That means the recipe advertises a
+    // flag the script does not implement -- a recipe/script disagreement, which P6 calls
+    // a logged defect. Name it rather than letting it read as a step failure.
+    console.error(dim(`  (exit 2 from argparse usually means ${recipe.file} advertises a flag this script does not implement)`));
+  }
+  return r.status === null ? 1 : r.status;
+}
+
+function cmdRun(argv) {
+  const recipeName = argv._[0];
+  if (!recipeName) die('usage: snickerdoodle run <recipe> [--step <name>] [--mode dialogic] [--sample] [--no-write]');
+  const recipe = loadRecipe(recipeName);
+
+  const passthrough = [];
+  if (argv.sample) passthrough.push('--sample');
+  if (argv['no-write']) passthrough.push('--no-write');
+  if (argv['fixture-set']) passthrough.push('--fixture-set', argv['fixture-set']);
+
+  if (argv.step) {
+    const step = recipe.steps.get(argv.step);
+    if (!step) {
+      die(`unknown step "${argv.step}"\n  ${recipe.slug} declares:\n` +
+          [...recipe.steps.keys()].map((s) => `    ${s}`).join('\n'));
+    }
+    process.exit(runStep(recipe, step, passthrough));
+  }
+
+  // No --step: run the whole flow in the order the recipe lists it.
+  if (argv.mode && argv.mode !== 'dialogic') {
+    die(`--mode ${argv.mode} is not available. Only dialogic mode exists; silent mode is earned, not configured (P8).`);
+  }
+  const steps = [...recipe.steps.values()];
+  if (!steps.length) die(`${recipe.slug} declares no steps`);
+
+  console.error(bold(`${recipe.title}`) + dim(`  ·  ${steps.length} steps  ·  mode dialogic`));
+  const results = [];
+  for (const step of steps) {
+    const code = runStep(recipe, step, passthrough);
+    results.push({ step: step.slug, code });
+    if (code !== 0) {
+      // A nonzero exit is a hard stop, not a warning. The step has already reported
+      // everything it found; continuing past it would be proceeding past a judgment.
+      console.error(`\n${bold('STOPPED')} at step "${step.slug}" (exit ${code}).`);
+      console.error(dim('  The step reported its findings above. A human decides whether to continue.'));
+      process.exit(code);
+    }
+  }
+  console.error(`\n${bold('All ' + results.length + ' steps completed.')}`);
+  console.error(dim('  Completing is not passing. Gate decisions are a separate, human act:'));
+  console.error(dim(`    snickerdoodle gate ${recipe.slug} --gate 1 --decision approve --note "..."`));
+}
+
+// ---------------------------------------------------------------------------
+// gate
+// ---------------------------------------------------------------------------
+
+function whoAmI(explicit) {
+  if (explicit) return explicit;
+  try {
+    return execFileSync('git', ['config', 'user.name'], { encoding: 'utf8' }).trim() || null;
+  } catch { return null; }
+}
+
+// The gate tests in every recipe are POSIX shell: `test -f ...`, `find ... -exec ... \;`,
+// `rg ... || true`. Node's `shell: true` uses cmd.exe on Windows, which cannot run any of
+// that -- `find` there is a different program entirely. Running the tests under cmd.exe
+// made gate 3 report a failure for a test that passes, which would have been recorded as
+// real evidence. Run them in a POSIX shell, and say so if none is available rather than
+// reporting a shell mismatch as a failed gate.
+function posixShell() {
+  for (const sh of ['bash', 'sh']) {
+    try {
+      execFileSync(sh, ['-c', 'exit 0'], { stdio: 'pipe' });
+      return sh;
+    } catch { /* try the next */ }
+  }
+  return null;
+}
+
+function runGateTest(test) {
+  if (!test) return { ran: false, reason: 'the recipe declares no test for this gate' };
+  const sh = posixShell();
+  if (!sh) {
+    return {
+      ran: false,
+      command: test,
+      reason: 'no POSIX shell (bash or sh) available; the recipe gate tests are POSIX shell '
+        + 'and will not run under cmd.exe. Install one, or run the test by hand and record '
+        + 'the result with --residual-risk.',
+    };
+  }
+  const r = spawnSync(sh, ['-c', test], { encoding: 'utf8' });
+  const out = `${r.stdout || ''}${r.stderr || ''}`.trim();
+  return {
+    ran: true,
+    shell: sh,
+    command: test,
+    exit_code: r.status === null ? -1 : r.status,
+    passed: r.status === 0,
+    output_tail: out.split('\n').slice(-6).join('\n').slice(0, 1200) || null,
+  };
+}
+
+function cmdGate(argv) {
+  const recipeName = argv._[0];
+  if (!recipeName) die('usage: snickerdoodle gate <recipe> --gate N --decision approve|deny|defer --note "..."');
+  const recipe = loadRecipe(recipeName);
+
+  const num = Number(argv.gate);
+  if (!Number.isInteger(num)) die('--gate N is required (an integer)');
+  const gate = recipe.gates.get(num);
+  if (!gate) {
+    die(`${recipe.slug} declares no gate ${num}\n  gates: ${[...recipe.gates.keys()].join(', ') || 'none'}`);
+  }
+
+  const decision = argv.decision;
+  if (!['approve', 'deny', 'defer'].includes(decision)) {
+    die('--decision must be approve, deny or defer\n  deny and defer are real outcomes: a gate decided "no" is a closed gate, an unexamined one is not');
+  }
+  if (!argv.note) die('--note "..." is required. "Looks good" is not a handoff condition (P4); say what you judged.');
+
+  const by = whoAmI(argv.by);
+  if (!by) die('--by "Name" is required (git user.name is unset). A gate is cleared by a NAMED human (P4).');
+
+  // Some gates govern outward-facing, irreversible actions -- a model call, a message
+  // sent, an external write. Their tests are necessarily negative: gate 5's passes
+  // because nothing has performed a live call, which is evidence that nothing HAS run,
+  // never evidence that running is approved. Letting a passing test carry such an
+  // approval is the category error P4 calls clearing on vibes, so approving one of these
+  // takes a second, explicit act.
+  //
+  // Which gates these are is read from the recipe's own wording, not hardcoded to a
+  // number -- gate 5 happens to be the approval gate in this recipe's template, and that
+  // is a fact about the template rather than about gates.
+  const governsLive = /live (network )?call|external write|credential|publish|notification|model call/i
+    .test(`${gate.condition} ${gate.name}`);
+  if (decision === 'approve' && governsLive && !argv['authorize-live']) {
+    die(
+      `gate ${num} ("${gate.name}") governs live or external action.\n` +
+      `  condition: ${gate.condition}\n` +
+      "  Its test passing means nothing has run unapproved -- that is not evidence FOR an approval.\n" +
+      '  Approving it authorises irreversible outward-facing actions. If you intend that,\n' +
+      '  pass --authorize-live as well, and write a note that says what you checked.\n' +
+      '  To record a refusal instead: --decision deny',
+    );
+  }
+
+  const evidence = runGateTest(gate.test);
+  if (decision === 'approve' && evidence.ran && !evidence.passed) {
+    die(
+      `refusing to record an approval: this gate's own test failed (exit ${evidence.exit_code}).\n` +
+      `  test: ${gate.test}\n` +
+      '  approve a gate whose test fails and the test stops meaning anything.\n' +
+      '  fix the failure, or record --decision deny / defer with a note explaining why.',
+    );
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const record = {
+    workflow: recipe.title,
+    recipe: recipe.file.split(path.sep).join('/'),
+    recipe_version: recipe.frontmatter.recipe_version || null,
+    gate: num,
+    gate_name: gate.name,
+    human_capacity: gate.capacity ? `[${gate.capacity}]` : null,
+    handoff_condition: gate.condition,
+    decision,
+    note: argv.note,
+    decided_by: { name: by, role: argv.role || 'recipe owner' },
+    decided_at: today,
+    governs_live_action: governsLive,
+    approved_for_live_action: decision === 'approve' && governsLive && Boolean(argv['authorize-live']),
+    gate_test: evidence,
+    recorded_by: 'scripts/snickerdoodle.mjs',
+    residual_risk: argv['residual-risk']
+      || 'Not stated. The gate test is a conformance check; whether the result is ADEQUATE is a human judgment and is not captured by it (P1).',
+    voids_if: 'Any edit to the recipe or its step scripts, or any change to the data this gate was cleared against, voids this decision.',
+  };
+
+  fs.mkdirSync(GATE_DIR, { recursive: true });
+  const out = path.join(GATE_DIR, `${recipe.slug}-gate-${num}.json`);
+  if (fs.existsSync(out) && !argv.force) {
+    const prev = JSON.parse(fs.readFileSync(out, 'utf8'));
+    die(
+      `a decision for gate ${num} already exists:\n` +
+      `  ${out}\n` +
+      `  ${prev.decision} by ${prev.decided_by?.name || '?'} on ${prev.decided_at}\n` +
+      '  a gate decision records a judgment someone made on a date; replacing one is editing history.\n' +
+      '  pass --force if you intend to supersede it.',
+    );
+  }
+  fs.writeFileSync(out, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+
+  console.error(`${bold(`gate ${num} — ${gate.name}`)}  ${decision.toUpperCase()}`);
+  console.error(dim(`  by ${by} on ${today}`));
+  if (evidence.ran) {
+    console.error(dim(`  test ${evidence.passed ? 'passed' : `FAILED (exit ${evidence.exit_code})`}: ${gate.test}`));
+  } else {
+    console.error(dim(`  no test recorded: ${evidence.reason}`));
+  }
+  console.error(dim(`  written to ${out}`));
+  console.error(dim('  log it in logs/RUN_LOG.md — a decision not logged is not durable evidence.'));
+}
+
+// ---------------------------------------------------------------------------
+// list / status / help
+// ---------------------------------------------------------------------------
+
+function cmdList(argv) {
+  const files = fs.readdirSync(RECIPES_DIR).filter((f) => f.endsWith('.md') && f !== '_shared.md' && f !== 'README.md');
+  const rows = [];
+  for (const f of files) {
+    const text = fs.readFileSync(path.join(RECIPES_DIR, f), 'utf8');
+    const status = (text.match(/^status:\s*(\S+)/m) || [null, '—'])[1];
+    const built = (text.match(/### Script Locations[\s\S]*?(?=\n## |\n### |$)/) || [''])[0]
+      .split('\n').map((l) => backtick(l)).filter((p) => p && p.endsWith('.py') && fs.existsSync(p)).length;
+    rows.push({ slug: f.replace(/\.md$/, ''), status, built });
+  }
+  if (argv.built) rows.sort((a, b) => b.built - a.built);
+  const show = argv.built ? rows.filter((r) => r.built > 0) : rows;
+  console.log(`${show.length} recipe(s)${argv.built ? ' with at least one built step' : ''}\n`);
+  for (const r of show) {
+    console.log(`  ${r.slug.padEnd(52)} ${String(r.status).padEnd(18)} ${r.built}/6 steps built`);
+  }
+}
+
+function cmdHelp() {
+  console.log(`${bold('snickerdoodle')} — run a recipe, record a gate decision
+
+${bold('USAGE')}
+  snickerdoodle run <recipe> [--step <name>] [--mode dialogic] [--sample] [--no-write]
+  snickerdoodle gate <recipe> --gate N --decision approve|deny|defer --note "..." [--by "Name"]
+  snickerdoodle list [--built]
+
+${bold('RUN')}
+  With --step, runs that one step. Without it, runs every step the recipe declares,
+  in order, and ${bold('stops on the first nonzero exit')} — a step that halts has already
+  reported what it found, and continuing would proceed past a judgment.
+
+  --sample      no live network calls, no external writes
+  --no-write    compute, write nothing
+  --fixture-set clean|defective (passed through to steps that accept it)
+
+${bold('GATE')}
+  Runs the gate's own test from the recipe, records what it saw, and writes
+  ${GATE_DIR}/<recipe>-gate-N.json.
+
+  It refuses to record an ${bold('approve')} when the gate's test fails, refuses a decision
+  without --note, and refuses to overwrite an existing decision without --force.
+  deny and defer are first-class: a gate decided "no" is closed; an unexamined one is not.
+
+${bold('NOTES')}
+  The recipe is the configuration. Steps, scripts, gates and tests are read from the
+  recipe markdown, so there is nothing to keep in sync with it.
+
+  Completing the steps is not passing the gates. Running is an AI act; clearing a gate
+  is a human one (P1).
+`);
+}
+
+// ---------------------------------------------------------------------------
+// argv
+// ---------------------------------------------------------------------------
+
+function parseArgv(args) {
+  const out = { _: [] };
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+    if (a.startsWith('--')) {
+      const [k, inline] = a.slice(2).split('=');
+      if (inline !== undefined) out[k] = inline;
+      else if (args[i + 1] && !args[i + 1].startsWith('--')) { out[k] = args[i + 1]; i += 1; }
+      else out[k] = true;
+    } else out._.push(a);
+  }
+  return out;
+}
+
+function main() {
+  const [verb, ...rest] = process.argv.slice(2);
+  const argv = parseArgv(rest);
+  if (!verb || verb === 'help' || argv.help) return cmdHelp();
+  if (verb === 'run') return cmdRun(argv);
+  if (verb === 'gate') return cmdGate(argv);
+  if (verb === 'list') return cmdList(argv);
+  die(`unknown command "${verb}"\n  commands: run, gate, list, help`);
+}
+
+main();
