@@ -147,11 +147,11 @@ Sample mode (no live network calls, no writes):
 | Step | CLI Command | Flags |
 |---|---|---|
 | Verify provenance | `snickerdoodle run market-sentiment-analysis-part-1 --step verify-provenance` | `--sample` `--no-write` |
-| Ingest declared inputs | `snickerdoodle run market-sentiment-analysis-part-1 --step ingest-inputs` | `--sample` |
-| Validate data shape | `snickerdoodle run market-sentiment-analysis-part-1 --step validate-data-shape` | `--sample` |
-| Transform and quality check | `snickerdoodle run market-sentiment-analysis-part-1 --step transform-quality-check` | `--sample` |
-| Run approved tools | `snickerdoodle run market-sentiment-analysis-part-1 --step run-approved-tools` | `--sample` `--no-write` |
-| Produce human report | `snickerdoodle run market-sentiment-analysis-part-1 --step produce-human-report` | `--sample` `--no-write` |
+| Ingest declared inputs | `snickerdoodle run market-sentiment-analysis-part-1 --step ingest-inputs` | `--sample` `--fixture-set` |
+| Validate data shape | `snickerdoodle run market-sentiment-analysis-part-1 --step validate-data-shape` | `--sample` `--fixture-set` |
+| Transform and quality check | `snickerdoodle run market-sentiment-analysis-part-1 --step transform-quality-check` | `--sample` `--fixture-set` |
+| Run approved tools | `snickerdoodle run market-sentiment-analysis-part-1 --step run-approved-tools` | `--sample` `--no-write` `--fixture-set` |
+| Produce human report | `snickerdoodle run market-sentiment-analysis-part-1 --step produce-human-report` | `--sample` `--no-write` `--fixture-set` |
 
 ### Gate Commands
 
