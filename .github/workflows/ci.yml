@@ -34,7 +34,7 @@ jobs:
 
     - name: Run Unit Tests (Regex & Evaluation Logic)
       run: |
-        pytest tests/test_main.py -v
+        python -m pytest tests/test_main.py -v
 
     - name: Start Gatekeeper Service via Docker Compose
       run: |
