@@ -627,3 +627,26 @@ workflow changes.
 ## 2026-10-10 -- portfolio-price-fetcher: run instructions added
 
 - **Artifact:** `logs/portfolio-price-fetcher/README.md`, covering how to run the closed steps of `recipes/portfolio-price-fetcher.md` and `recipes/portfolio-dashboard.md` (commands, stop conditions, outputs, the sample corpus, what is not covered). Documentation only; no script or data changed.
+
+## 2026-10-17 -- what-if-simulation-agent: three [TODO: DEV] closures + two script mappings (provenance, data shape, the six-node port), sample mode
+
+- **Recipe:** `recipes/what-if-simulation-agent.md`, which had no status frontmatter. It now carries `status: DRAFT`, `todos_open: 5`, `recipe_version: 0.2.0`, `attestation: null`. It stays `DRAFT`, which is honest: the recipe is not yet SPECIFIED.
+- **Closed (each with its script, a status line and evidence in the recipe):**
+  - step 1 `scripts/tools/what-if-simulation-agent-verify-provenance.py`; step 3 `scripts/gigo/what-if-simulation-agent-validate-data-shape.py`; step 5 `scripts/tools/what-if-simulation-agent-run-approved-tools.py`
+  - mapped to those scripts, with the original notes kept: the Parse & Validate Input node (to step 3's contract and step 5's first node) and the Aggregate & Score All Simulations node (to step 5)
+- **Inputs:** the recipe's declared workflow JSON (read as the named source file); a frozen sample corpus `data/raw/what-if-simulation-agent/sample/` (15 clean requests that reach all 9 growth-and-sentiment cells, all 3 risk appetites, all 3 horizons and all 5 final recommendations; 10 catalogued defective ones; SHA-256 manifest; every company and number invented); `data/raw/what-if-simulation-agent/run-envelope.json` declaring sample mode.
+- **Outputs:** `logs/what-if-simulation-agent-provenance-2026-10-17.json`, `logs/what-if-simulation-agent-run-approved-tools-2026-10-17.json`, `data/verified/what-if-simulation-agent/{clean,defective}/validated.json` and `validate-audit.md`, `data/verified/what-if-simulation-agent/clean/simulation-results.json`, `logs/what-if-simulation-agent/{parity-results.json,self-test-results.json,self-test-results.md,README.md}`.
+- **Commands:**
+  - step 1: exit 0 (node table matches the workflow's 13 nodes, the connections form the chain the port assumes, fixtures intact)
+  - step 3: clean exit 0 (15/15 accepted); defective exit 1 by design (10/10 rejected, each for its own reason)
+  - step 5: clean exit 0 (15 results, each ending in the prompt the Groq node would send); defective refused (exit 1, nothing written)
+  - `python3 scripts/tools/what-if-simulation-agent-parity-check.py`: exit 0, 23/23 requests identical to the original JavaScript (every field, every character of the prompt), with the clock and Math.random pinned inside the JavaScript run
+  - `python3 scripts/tools/what-if-simulation-agent-self-test.py`: exit 0, 18/18 checks as expected, including 10 deliberate breaks (a renamed node, a skipped simulator, a changed fixture, the tools handed rejected data, and four breaks of the port: Python's round, Python's formatting, Python's min/max with NaN, Python's number printing; each caught)
+  - `node scripts/conformance.mjs`: all conform; `node scripts/manifest-check.mjs`: passed
+- **Fixed while building:** the parity check found that Python's `min` and `max` do not treat NaN the way JavaScript's `Math.min` and `Math.max` do (any NaN makes the answer NaN), which changed the aggregate verdict on the two NaN requests. The port now has `js_min` and `js_max`. The self-test's break for it is caught.
+- **Observation, offered as an open question for the maintainers and not as a finding:** in JavaScript a value that parses to NaN passes every comparison, so the Parse & Validate Input node's own five rules accept it. The step-3 gate here adds one rule (numeric fields must be finite) and says so in every audit; the port itself still copies the node exactly, so the parity check can compare NaN behaviour too.
+- **Unchanged:** the eight generated per-node scripts for this recipe (`scripts/gigo/what-if-simulation-agent-parse-groq-response.py`, `-parse-validate-input.py`, `-save-to-postgresql.py`; `scripts/tools/what-if-simulation-agent-aggregate-score-all-simulations.py`, `-build-ai-prompt.py`, `-groq-generate-investment-insights.py`, `-sim-2-risk-appetite-simulator.py`, `-webhook-receive-simulation-request.py`), and the sibling recipe `recipes/n8n-what-if-simulation-agent.md`.
+- **Open issues:**
+  - [OPEN] Steps 2, 4 and 6 and the script mappings for the respond-to-webhook and human-report nodes: still `[TODO: DEV]` (`todos_open` is 5).
+  - [OPEN] Live mode: no approval record; the Groq call and the PostgreSQL write are only recorded handoffs (`approved_for_live_action: false`); the nodes after the prompt are not ported.
+  - [NOT COVERED] Real market data, live behaviour, and whether the simulators' investment logic is sound (ported faithfully, not judged).
