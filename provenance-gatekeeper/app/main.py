@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -6,6 +7,10 @@ import sqlite3
 import requests
 import os
 import re
+from datetime import timedelta
+
+# Auth imports
+from .auth import Token, User, create_access_token, get_current_user, ACCESS_TOKEN_EXPIRE_MINUTES, FAKE_USERS_DB, verify_password
 from . import dashboard
 
 app = FastAPI(title="Provenance Gatekeeper")
@@ -124,9 +129,25 @@ def trigger_alert(claim_id: str, variance_type: str, explanation: str):
     except Exception as e:
         print(f"Failed to trigger external alert: {e}")
 
-# --- THE N8N WEBHOOK ---
+# --- WEEK 8: AUTHENTICATION ENDPOINT ---
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user_dict = FAKE_USERS_DB.get(form_data.username)
+    if not user_dict or not verify_password(form_data.password, user_dict["hashed_password"]):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user_dict["username"]}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# --- THE N8N WEBHOOK (PROTECTED) ---
 @app.post("/verify", response_model=VerificationVerdict)
-def verify_claim(request: ClaimRequest):
+def verify_claim(request: ClaimRequest, current_user: User = Depends(get_current_user)):
     try:
         claim_embedding = model.encode(request.generated_claim).tolist()
         results = collection.query(query_embeddings=[claim_embedding], n_results=1)
