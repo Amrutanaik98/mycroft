@@ -800,3 +800,31 @@
   - [OPEN] Steps 2, 4 and 6 and the script mappings for the respond-to-webhook and human-report nodes: still `[TODO: DEV]` (`todos_open` is 5).
   - [OPEN] Live mode: no approval record; the Groq call and the PostgreSQL write are only recorded handoffs (`approved_for_live_action: false`); the nodes after the prompt are not ported.
   - [NOT COVERED] Real market data, live behaviour, and whether the simulators' investment logic is sound (ported faithfully, not judged).
+
+
+## 2026-10-25 -- scenariostresstestingagent: three [TODO: DEV] closures (provenance, data shape, the stress-test chain port), sample mode
+
+- **Recipe:** `recipes/scenariostresstestingagent.md`, which had no status frontmatter. It now carries `status: DRAFT`, `todos_open: 5`, `recipe_version: 0.2.0`, `attestation: null`. It stays `DRAFT`, which is honest: the recipe is not yet SPECIFIED.
+- **Closed (each with its script, a status line and evidence in the recipe):**
+  - step 1 `scripts/tools/scenariostresstestingagent-verify-provenance.py`; step 3 `scripts/gigo/scenariostresstestingagent-validate-data-shape.py`; step 5 `scripts/tools/scenariostresstestingagent-run-approved-tools.py`
+  - the step-5 port also covers, with the generated per-node scripts left unchanged, the Stress_Test_Engine and Save_Portfolio_Before_LLM nodes (an "Also covered" line under each), and the Validate Portfolio and Load_Template_Scenario code nodes, which the recipe does not list as steps
+- **Inputs:** the recipe's declared workflow JSON (read as the named source file); a frozen sample corpus `data/raw/scenariostresstestingagent/sample/` (12 clean requests that reach all five template scenarios, the custom-scenario route, all four risk levels, both sides of the weight-rescale rule and the exact 10-percent threshold; 10 catalogued defective ones; SHA-256 manifest; every portfolio and number invented); `data/raw/scenariostresstestingagent/run-envelope.json` declaring sample mode.
+- **Outputs:** `logs/scenariostresstestingagent-provenance-2026-10-25.json`, `logs/scenariostresstestingagent-run-approved-tools-2026-10-25.json`, `data/verified/scenariostresstestingagent/{clean,defective}/validated.json` and `validate-audit.md`, `data/verified/scenariostresstestingagent/clean/stress-results.json`, `logs/scenariostresstestingagent/{parity-results.json,self-test-results.json,self-test-results.md,README.md}`.
+- **Commands:**
+  - step 1: exit 0 (node table matches the workflow's 16 nodes, the 18 connections match the wiring the port assumes, fixtures intact)
+  - step 3: clean exit 0 (12/12 accepted); defective exit 1 by design (10/10 rejected, each for its own reason)
+  - step 5: clean exit 0 (11 stress-tested, 1 stopped at the Groq handoff; risk levels CRITICAL 7, HIGH 1, MODERATE 1, LOW 2); defective refused (exit 1, nothing written)
+  - `python3 scripts/tools/scenariostresstestingagent-parity-check.py`: exit 0, 24/24 compared cases identical to the original code (Validate Portfolio under node; the three Python nodes by exec inside a small shim), one defective request (a string weight) not modelled and refused by the gate
+  - `python3 scripts/tools/scenariostresstestingagent-self-test.py`: exit 0, 27/27 checks as expected, including 12 deliberate breaks (a renamed node, a rewired connection, a tampered fixture, a holding without a ticker, and eight breaks of the port: no rescale, a wrong threshold, `>=` for `>`, one-decimal rounding, an extra shock, a wrong default scenario, a wrong sector, a custom scenario on the template branch; each caught)
+  - `node scripts/conformance.mjs`: all conform; `node scripts/manifest-check.mjs`: passed
+- **Fixed while building:** none needed beyond a corpus design choice; the parity check matched on the first full run (including the engine's error branches and the `portfolio.holdings is not iterable` message).
+- **Observations, offered as open questions for the maintainers and not as findings:**
+  - the Stress_Test_Engine uses a fixed sector map (ten tickers; any other ticker is treated as `tech_sector`) and a fixed starting value of 10000; the two lists `ai_stocks` and `growth_stocks` are fixed too
+  - two template shocks are defined but the engine never reads them: `volatility_spike` (every scenario) and `all_sectors` (black_swan), so black_swan applies only its market shock; `horizon_days` passes through Validate Portfolio and is not used
+  - a holding with no weight passes Validate Portfolio when the other weights sum to 1.0 and then fails in the engine (`KeyError: 'weight'`); all-zero weights are rescaled by zero, become NaN, and the engine fails on them (`TypeError`); a negative weight, an unknown scenario_type, and an empty holdings array all run without a message (the step-3 gate rejects these four, says so in its audit, and the port reproduces the workflow's behaviour so parity holds either way)
+  - the Fetch_Data node carries a placeholder API key string and a fixed symbol (NVDA); it is never called here
+- **Unchanged:** the eight generated per-node scripts for this recipe (`scripts/gigo/scenariostresstestingagent-parse-input.py`; `scripts/ingest/scenariostresstestingagent-fetch-data.py`; `scripts/tools/scenariostresstestingagent-{basic-llm-chain,groq-chat-model,parse-llm-response,save-portfolio-before-llm,stress-test-engine,webhook-trigger}.py`).
+- **Open issues:**
+  - [OPEN] Steps 2, 4 and 6 and the script mappings for the respond-to-webhook and human-report nodes: still `[TODO: DEV]` (`todos_open` is 5).
+  - [OPEN] Live mode: no approval record; the Alpha Vantage request, the Groq call and the webhook reply are only recorded handoffs (`approved_for_live_action: false`); Parse_LLM_Response is not ported, so a custom scenario stops at the Groq handoff.
+  - [NOT COVERED] Real portfolios, live behaviour, and whether the template shocks and the engine's risk thresholds are sound (ported faithfully, not judged).
