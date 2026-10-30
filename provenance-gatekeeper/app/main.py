@@ -120,12 +120,19 @@ def log_evaluation(claim_id: str, generated_claim: str, verdict: str, variance_t
     conn.close()
 
 def trigger_alert(claim_id: str, variance_type: str, explanation: str):
-    webhook_url = os.getenv("ALERT_WEBHOOK_URL", "https://mock-webhook-url.com/alert")
+    webhook_url = os.getenv("ALERT_WEBHOOK_URL", "http://n8n:5678/webhook/hallucination-alert")
+    
+    # Send the exact JSON keys that n8n is waiting for
     payload = {
-        "text": f"🚨 **Gatekeeper Alert: Hallucination Intercepted!**\n*Claim ID:* {claim_id}\n*Type:* {variance_type}\n*Details:* {explanation}"
+        "claim_id": claim_id,
+        "variance_type": variance_type,
+        "explanation": explanation
     }
+    
     try:
-        print(f"ALERT SENT to {webhook_url}: {payload}")
+        # Actually fire the HTTP POST request to the n8n container
+        requests.post(webhook_url, json=payload, timeout=5)
+        print(f"REAL ALERT SENT to {webhook_url}: {payload}")
     except Exception as e:
         print(f"Failed to trigger external alert: {e}")
 
