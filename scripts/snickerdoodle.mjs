@@ -37,6 +37,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 const RECIPES_DIR = 'recipes';
 const GATE_DIR = 'logs/gate-decisions';
@@ -253,6 +254,14 @@ function cmdRun(argv) {
 // gate
 // ---------------------------------------------------------------------------
 
+function declaredMode(recipe) {
+  const envelope = `data/raw/${recipe.slug}/run-envelope.json`;
+  if (!fs.existsSync(envelope)) return { mode: null, source: null };
+  try {
+    return { mode: JSON.parse(fs.readFileSync(envelope, 'utf8')).mode || null, source: envelope };
+  } catch { return { mode: null, source: envelope }; }
+}
+
 function whoAmI(explicit) {
   if (explicit) return explicit;
   try {
@@ -274,6 +283,108 @@ function posixShell() {
     } catch { /* try the next */ }
   }
   return null;
+}
+
+// The hand-written records from week five carried an evidence set: the files the decision
+// rests on, each with its SHA-256, so a reader can confirm they are looking at what was
+// judged. Deriving that set has to be principled rather than a guess, so it comes from the
+// gate's OWN test: the paths the test names are the files the gate is about. The recipe is
+// added because every gate decision rests on the version of the recipe it was made against.
+//
+// Directories are expanded one level into their files; a path that does not exist is
+// recorded as absent rather than skipped, because "the evidence was missing" is itself
+// evidence about the decision.
+function gateEvidenceFiles(recipe, gate) {
+  const seen = new Map();
+  const addFile = (p) => {
+    const rel = p.split(path.sep).join('/');
+    if (seen.has(rel)) return;
+    let sha = null;
+    let bytes = null;
+    try {
+      const buf = fs.readFileSync(rel);
+      sha = createHash('sha256').update(buf).digest('hex');
+      bytes = buf.length;
+    } catch { /* unresolved; described below */ }
+    if (sha !== null) {
+      seen.set(rel, { path: rel, resolved: true, sha256: sha, size_bytes: bytes });
+      return;
+    }
+    // Not every path-shaped token in a shell command is a path. Gate 4's test is
+    // `for s in tools/verify-provenance ingest/ingest-inputs ...` -- those are loop
+    // VALUES; gate 6's names logs/<recipe>-[DATE].json, a template. Calling either an
+    // "absent file" would assert something missing that is not, so an unresolved token
+    // is recorded as exactly that, with its ambiguity named.
+    seen.set(rel, {
+      path: rel,
+      resolved: false,
+      sha256: null,
+      note: 'named by the gate test but not a file on disk — a loop value, a template '
+        + 'such as [DATE], or a genuinely missing file; this record does not distinguish them',
+    });
+  };
+
+  addFile(recipe.file);
+
+  // Pull path-shaped tokens out of the gate's test command.
+  const tokens = (gate.test || '').match(/[A-Za-z0-9_./-]+\/[A-Za-z0-9_./*-]+/g) || [];
+  for (const raw of tokens) {
+    const t = raw.replace(/["'`]/g, '');
+    if (t.includes('*')) continue;            // a glob is not a file
+    if (!fs.existsSync(t)) { addFile(t); continue; }
+    const st = fs.statSync(t);
+    if (st.isDirectory()) {
+      // Walk the tree, not one level. Gate 3's test names data/raw/<slug> and
+      // data/verified/<slug>, whose artifacts live two levels down under sample/ and
+      // runs/ -- stopping at depth 1 hashed the directory's children and missed every
+      // file the gate is actually about.
+      walk(t, (f) => addFile(f));
+    } else addFile(t);
+  }
+  const files = [...seen.values()];
+  // A decision record is read by a person. Hashing an unbounded tree would bury the
+  // decision under its own evidence, so cap it and say that the cap was hit.
+  if (files.length > EVIDENCE_CAP) {
+    const kept = files.slice(0, EVIDENCE_CAP);
+    kept.push({
+      path: `… ${files.length - EVIDENCE_CAP} more file(s) not listed`,
+      resolved: true,
+      sha256: null,
+      truncated: true,
+      total_matched: files.length,
+      note: `evidence set capped at ${EVIDENCE_CAP}; the gate test covers all of them`,
+    });
+    return kept;
+  }
+  return files;
+}
+
+const EVIDENCE_CAP = 60;
+
+function walk(dir, onFile, depth = 0) {
+  if (depth > 6) return;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) walk(p, onFile, depth + 1);
+    else if (e.isFile()) onFile(p);
+  }
+}
+
+// Does a RUN_LOG entry exist for today? The record should point at one, but asserting a
+// pointer to an entry nobody wrote is exactly the broken link P3 is about. Check, and say
+// what was found either way.
+function runLogRef(today) {
+  const file = 'logs/RUN_LOG.md';
+  if (!fs.existsSync(file)) return { path: file, entry_exists: false, note: 'no RUN_LOG at that path' };
+  const text = fs.readFileSync(file, 'utf8');
+  const has = new RegExp(`^## ${today}\\b`, 'm').test(text);
+  return {
+    path: `${file}#${today}`,
+    entry_exists: has,
+    note: has ? null : `no "## ${today}" entry yet — log this decision; a decision not logged is not durable evidence`,
+  };
 }
 
 function runGateTest(test) {
@@ -354,7 +465,23 @@ function cmdGate(argv) {
     );
   }
 
-  const today = new Date().toISOString().slice(0, 10);
+  // Local date, not toISOString(): that is UTC and can read a day ahead of the person
+  // recording the decision, which is confusing in a record whose whole point is who
+  // decided what, when.
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const { mode, source: modeSource } = declaredMode(recipe);
+  const evidenceFiles = gateEvidenceFiles(recipe, gate);
+  const unresolvedEvidence = evidenceFiles.filter((f) => f.resolved === false).length;
+
+  // What was SEEN, assembled from the test that actually ran -- not a restatement of the
+  // operator's note, which is what they concluded.
+  const observed = evidence.ran
+    ? `Gate test exited ${evidence.exit_code} (${evidence.passed ? 'passed' : 'failed'}) under ${evidence.shell}. `
+      + `${evidenceFiles.length - unresolvedEvidence} evidence file(s) hashed, ${unresolvedEvidence} token(s) unresolved.`
+      + (evidence.output_tail ? ` Output tail: ${evidence.output_tail.split(/\r?\n/).slice(-2).join(' / ')}` : '')
+    : `No test run: ${evidence.reason}. ${evidenceFiles.length - unresolvedEvidence} evidence file(s) hashed, ${unresolvedEvidence} token(s) unresolved.`;
+
   const record = {
     workflow: recipe.title,
     recipe: recipe.file.split(path.sep).join('/'),
@@ -367,12 +494,29 @@ function cmdGate(argv) {
     note: argv.note,
     decided_by: { name: by, role: argv.role || 'recipe owner' },
     decided_at: today,
+    mode,
+    mode_source: modeSource,
+    scope: mode === 'sample'
+      ? 'This decision covers the sample run over the frozen fixture corpus only. It says nothing about live execution.'
+      : mode
+        ? `This decision covers a run declared mode=${mode}.`
+        : 'No run envelope declares a mode, so the scope of this decision is not established by any artifact.',
+    evidence_observed: observed,
+    evidence_files: evidenceFiles,
+    run_log: runLogRef(today),
     governs_live_action: governsLive,
     approved_for_live_action: decision === 'approve' && governsLive && Boolean(argv['authorize-live']),
     gate_test: evidence,
     recorded_by: 'scripts/snickerdoodle.mjs',
-    residual_risk: argv['residual-risk']
-      || 'Not stated. The gate test is a conformance check; whether the result is ADEQUATE is a human judgment and is not captured by it (P1).',
+    residual_risk: argv['residual-risk'] || (
+      'NOT STATED by the decider. What the gate test establishes is conformance; whether the '
+      + 'result is ADEQUATE is a human judgment and no test captures it (P1). '
+      + (unresolvedEvidence
+        ? `${unresolvedEvidence} token(s) in the gate test did not resolve to a file, so the evidence set may be partial. `
+        : '')
+      + 'Pass --residual-risk to replace this with what you actually judged to be left open.'
+    ),
+    residual_risk_stated: Boolean(argv['residual-risk']),
     voids_if: 'Any edit to the recipe or its step scripts, or any change to the data this gate was cleared against, voids this decision.',
   };
 
